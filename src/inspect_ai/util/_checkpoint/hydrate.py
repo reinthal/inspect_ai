@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import shutil
 from dataclasses import dataclass, field
 from functools import partial
@@ -65,6 +66,20 @@ from ._layout import (
 from ._sandbox_restic import ingress_sandbox, init_sandbox_repo, inject_restic
 from .checkpointer import ResumeCheckpoint
 from .config import ResolvedCheckpointConfig
+
+# Set to enable verbose hydrate/validate logging + resume-shape
+# assertions. Left in the tree so the next time something looks off
+# we can re-enable in one place; off by default in normal runs.
+_VALIDATE_ENV_VAR = "INSPECT_CHECKPOINT_VALIDATE"
+
+
+def _validation_enabled() -> bool:
+    return bool(os.environ.get(_VALIDATE_ENV_VAR))
+
+
+def _debug(*args: Any, **kwargs: Any) -> None:
+    if _validation_enabled():
+        print(*args, **kwargs)
 
 
 @dataclass
@@ -109,11 +124,11 @@ async def hydrate(
     epoch: int,
     resume_checkpoint: ResumeCheckpoint | None,
 ) -> HydrationResult:
-    print(
+    _debug(
         f"[hydrate] start sample={sample_id} epoch={epoch} mode={'resume' if resume_checkpoint else 'fresh'}"
     )
     if resume_checkpoint:
-        print(f"[hydrate]   resume from {resume_checkpoint.sample_checkpoints_dir}")
+        _debug(f"[hydrate]   resume from {resume_checkpoint.sample_checkpoints_dir}")
 
     # Phase 1: synchronous prologue. After this completes, every Phase 2
     # function can read the password from <new sample dir>/sample.json
@@ -124,9 +139,9 @@ async def hydrate(
     new_sample_checkpoints_dir = await ensure_sample_checkpoints_dir(
         new_eval_checkpoints_dir, sample_id, epoch
     )
-    print(f"[hydrate] sample_checkpoints_dir={new_sample_checkpoints_dir}")
+    _debug(f"[hydrate] sample_checkpoints_dir={new_sample_checkpoints_dir}")
     sample_working_dir = await ensure_sample_working_dir(log_location, sample_id, epoch)
-    print(f"[hydrate] sample_working_dir={sample_working_dir}")
+    _debug(f"[hydrate] sample_working_dir={sample_working_dir}")
     if resume_checkpoint:
         # Bring the cross-cutting bits over first so `ensure_sample_json`
         # reads the inherited password instead of minting a fresh one,
@@ -137,7 +152,7 @@ async def hydrate(
             new_sample_checkpoints_dir,
         )
     sample_state = await ensure_sample_json(new_sample_checkpoints_dir)
-    print(f"[hydrate] restic_password={sample_state.restic_password[:8]}...")
+    _debug(f"[hydrate] restic_password={sample_state.restic_password[:8]}...")
     host_restic = await resolve_restic()
     host_repo = f"{new_sample_checkpoints_dir}/host"
 
@@ -152,7 +167,7 @@ async def hydrate(
         latest_committed_id = await anyio.to_thread.run_sync(
             scan_latest_committed_id, new_sample_checkpoints_dir
         )
-        print(f"[hydrate] latest committed sidecar id: {latest_committed_id}")
+        _debug(f"[hydrate] latest committed sidecar id: {latest_committed_id}")
 
     # Phase 2: host + sandboxes in parallel. Host work runs alongside
     # the per-sandbox fan-out; each sandbox's work is independent of
@@ -172,7 +187,7 @@ async def hydrate(
             latest_committed_id=latest_committed_id,
         )
 
-    print("[hydrate] phase-2 host + sandboxes start (parallel)")
+    _debug("[hydrate] phase-2 host + sandboxes start (parallel)")
     async with anyio.create_task_group() as tg:
         tg.start_soon(_run_host)
         tg.start_soon(
@@ -185,8 +200,8 @@ async def hydrate(
             latest_committed_id,
         )
     assert host_result is not None  # task group ran _run_host to completion
-    print("[hydrate] phase-2 host + sandboxes done")
-    print(f"[hydrate] complete sample={sample_id} epoch={epoch}")
+    _debug("[hydrate] phase-2 host + sandboxes done")
+    _debug(f"[hydrate] complete sample={sample_id} epoch={epoch}")
 
     return HydrationResult(
         sample_checkpoints_dir=new_sample_checkpoints_dir,
@@ -208,9 +223,9 @@ async def _hydrate_host(
     latest_committed_id: int | None,
 ) -> _HostHydrationResult:
     if resume is None:
-        print(f"[hydrate.host] fresh init at {host_repo}")
+        _debug(f"[hydrate.host] fresh init at {host_repo}")
         await init_repo(host_restic, host_repo, restic_password)
-        print("[hydrate.host] fresh init done")
+        _debug("[hydrate.host] fresh init done")
         return _HostHydrationResult()
 
     # Resume: FS-copy the old host repo into the new one (preserves
@@ -218,7 +233,7 @@ async def _hydrate_host(
     # latest committed sidecar, restic-restore the latest snapshot into
     # the new sample working dir, then load the JSON files and push
     # framework state into the live Transcript + Store.
-    print(
+    _debug(
         f"[hydrate.host] resume: FS-copy {resume.sample_checkpoints_dir}/host"
         f" -> {host_repo}"
     )
@@ -236,12 +251,12 @@ async def _hydrate_host(
             host_restic, host_repo, restic_password, latest_committed_id
         )
         if dropped:
-            print(
+            _debug(
                 f"[hydrate.host] dropped {len(dropped)} orphan snapshot(s): {dropped}"
             )
-    print(f"[hydrate.host] restic restore latest -> {sample_working_dir}")
+    _debug(f"[hydrate.host] restic restore latest -> {sample_working_dir}")
     await restore_repo(host_restic, host_repo, restic_password, sample_working_dir)
-    print("[hydrate.host] load + push framework state")
+    _debug("[hydrate.host] load + push framework state")
     sample_checkpoints_dir = str(Path(host_repo).parent)
     result = await anyio.to_thread.run_sync(
         partial(
@@ -251,7 +266,7 @@ async def _hydrate_host(
             latest_committed_id,
         )
     )
-    print(
+    _debug(
         f"[hydrate.host] resume done: "
         f"events={len(result.condensed_events)} "
         f"msgs={len(result.msg_pool)} "
@@ -299,12 +314,12 @@ async def _hydrate_sandbox(
     latest_committed_id: int | None,
 ) -> None:
     env = sandbox(name)
-    print(f"[hydrate.sandbox:{name}] inject restic")
+    _debug(f"[hydrate.sandbox:{name}] inject restic")
     await inject_restic(env)
     if resume is None:
-        print(f"[hydrate.sandbox:{name}] fresh init in-container repo")
+        _debug(f"[hydrate.sandbox:{name}] fresh init in-container repo")
         await init_sandbox_repo(env, restic_password)
-        print(f"[hydrate.sandbox:{name}] fresh init done")
+        _debug(f"[hydrate.sandbox:{name}] fresh init done")
         return
 
     # Resume: FS-copy the old host-side sandbox repo into the new sample
@@ -314,7 +329,7 @@ async def _hydrate_sandbox(
     # the container (which also runs restic-restore to put files at
     # their original paths).
     new_host_side_repo = f"{new_sample_checkpoints_dir}/sandboxes/{name}"
-    print(
+    _debug(
         f"[hydrate.sandbox:{name}] resume: FS-copy"
         f" {resume.sample_checkpoints_dir}/sandboxes/{name} -> {new_host_side_repo}"
     )
@@ -332,16 +347,16 @@ async def _hydrate_sandbox(
             host_restic, new_host_side_repo, restic_password, latest_committed_id
         )
         if dropped:
-            print(
+            _debug(
                 f"[hydrate.sandbox:{name}] dropped {len(dropped)} orphan "
                 f"snapshot(s): {dropped}"
             )
-    print(
+    _debug(
         f"[hydrate.sandbox:{name}] ingress into container + restic restore"
         f" (paths={paths})"
     )
     await ingress_sandbox(env, new_host_side_repo, restic_password)
-    print(f"[hydrate.sandbox:{name}] resume done")
+    _debug(f"[hydrate.sandbox:{name}] resume done")
 
 
 async def _drop_orphan_snapshots(
@@ -398,11 +413,13 @@ def _fs_copy_cross_cutting(old_sample_dir: str, new_sample_dir: str) -> None:
     src_sample_json = old / "sample.json"
     if src_sample_json.exists():
         shutil.copy(src_sample_json, new / "sample.json")
-        print(f"[hydrate.copy] sample.json: {src_sample_json} -> {new / 'sample.json'}")
+        _debug(
+            f"[hydrate.copy] sample.json: {src_sample_json} -> {new / 'sample.json'}"
+        )
     sidecars = glob.glob(str(old / "ckpt-*.json"))
     for sidecar in sidecars:
         shutil.copy(sidecar, new / Path(sidecar).name)
-    print(f"[hydrate.copy] sidecars copied: {len(sidecars)}")
+    _debug(f"[hydrate.copy] sidecars copied: {len(sidecars)}")
 
 
 def _fs_copy_repo(
@@ -421,7 +438,7 @@ def _fs_copy_repo(
         )
     file_count = sum(1 for entry in src.rglob("*") if entry.is_file())
     shutil.copytree(src, new_repo, dirs_exist_ok=True)
-    print(f"[hydrate.copy] {label} repo: {src} -> {new_repo} ({file_count} files)")
+    _debug(f"[hydrate.copy] {label} repo: {src} -> {new_repo} ({file_count} files)")
 
 
 def _load_and_push_host_state(
@@ -446,7 +463,7 @@ def _load_and_push_host_state(
     """
     ctx = host_context.read(local_path(sample_working_dir))
 
-    print(
+    _debug(
         f"[hydrate.host] loaded: events={len(ctx.condensed_events)} "
         f"msgs={len(ctx.msg_pool)} calls={len(ctx.call_pool)} "
         f"attachments={len(ctx.attachments)} store_keys={len(ctx.store)} "
@@ -467,7 +484,7 @@ def _load_and_push_host_state(
             sample_checkpoints_dir, latest_committed_id
         )
         rehydrated_events.append(synthesized)
-        print(
+        _debug(
             f"[hydrate.host] synthesized trailing CheckpointEvent for "
             f"checkpoint {latest_committed_id}"
         )
@@ -490,8 +507,8 @@ def _load_and_push_host_state(
     ts = transcript()
     pre = [_event_label(e) for e in ts._events]
     restored = [_event_label(e) for e in pushed_events]
-    print(f"[hydrate.host] pre-hydration transcript.events (n={len(pre)}): {pre}")
-    print(f"[hydrate.host] restored events to push (n={len(restored)}): {restored}")
+    _debug(f"[hydrate.host] pre-hydration transcript.events (n={len(pre)}): {pre}")
+    _debug(f"[hydrate.host] restored events to push (n={len(restored)}): {restored}")
     ts._events.extend(pushed_events)
     ts._attachments.update(ctx.attachments)
     state = sample_state()
@@ -499,7 +516,7 @@ def _load_and_push_host_state(
         raise RuntimeError("_hydrate_host: no active sample state to populate Store")
     for key, value in ctx.store.items():
         state.store.set(key, value)
-    print(
+    _debug(
         f"[hydrate.host] pushed: transcript.events={len(ts._events)} "
         f"transcript.attachments={len(ts._attachments)} "
         f"store_keys={len(list(state.store.keys()))}"
@@ -646,17 +663,23 @@ def _validate_resume_state(
 
     Console-prints a readable summary either way so the resume flow
     is easy to follow.
+
+    No-op unless ``INSPECT_CHECKPOINT_VALIDATE`` is set — the body is
+    kept in the tree for the next time something looks off on resume.
     """
-    print("[hydrate.validate] === resume sanity check ===")
+    if not _validation_enabled():
+        return
+
+    _debug("[hydrate.validate] === resume sanity check ===")
 
     sample_dir = Path(local_path(sample_checkpoints_dir))
     sidecars = sorted(p.name for p in sample_dir.glob("ckpt-*.json"))
-    print(
+    _debug(
         f"[hydrate.validate] sidecars in {sample_dir.name}/ "
         f"(n={len(sidecars)}, latest committed id={latest_committed_id}): "
         f"{sidecars}"
     )
-    print(f"[hydrate.validate] events.json event count: {len(events)}")
+    _debug(f"[hydrate.validate] events.json event count: {len(events)}")
 
     # Walk events: collect checkpoint + prior_run span_begins,
     # CheckpointEvents, and all span_ends (span_end has no type attr —
@@ -683,23 +706,23 @@ def _validate_resume_state(
             if ckpt_id is not None:
                 checkpoint_events.append((i, ckpt_id))
 
-    print(f"[hydrate.validate] prior_run wraps (n={len(wrap_begins)}):")
+    _debug(f"[hydrate.validate] prior_run wraps (n={len(wrap_begins)}):")
     for idx, name, id_ in wrap_begins:
         end_idx = end_by_id.get(id_)
         end_str = f"span_end@{end_idx}" if end_idx is not None else "UNPAIRED"
-        print(f"  [{idx:4d}] name={name!r:24} id={id_:24} -> {end_str}")
+        _debug(f"  [{idx:4d}] name={name!r:24} id={id_:24} -> {end_str}")
 
-    print(
+    _debug(
         f"[hydrate.validate] checkpoint span_begin events (n={len(checkpoint_begins)}):"
     )
     for idx, name, id_ in checkpoint_begins:
         end_idx = end_by_id.get(id_)
         end_str = f"span_end@{end_idx}" if end_idx is not None else "UNPAIRED"
-        print(f"  [{idx:4d}] name={name!r:18} id={id_:24} -> {end_str}")
+        _debug(f"  [{idx:4d}] name={name!r:18} id={id_:24} -> {end_str}")
 
-    print(f"[hydrate.validate] CheckpointEvents (n={len(checkpoint_events)}):")
+    _debug(f"[hydrate.validate] CheckpointEvents (n={len(checkpoint_events)}):")
     for idx, ckpt_id in checkpoint_events:
-        print(f"  [{idx:4d}] checkpoint_id={ckpt_id}")
+        _debug(f"  [{idx:4d}] checkpoint_id={ckpt_id}")
 
     # --- assertions ---
     if not events:
@@ -794,8 +817,8 @@ def _validate_resume_state(
             f"got {actual_event_ids}"
         )
 
-    print("[hydrate.validate] ✓ resume sanity checks passed")
-    print(
+    _debug("[hydrate.validate] ✓ resume sanity checks passed")
+    _debug(
         f"[hydrate.validate] === ready for checkpoint "
         f"{len(checkpoint_begins) + 1} "
         f"(prior checkpoints: {len(checkpoint_begins)}, "
